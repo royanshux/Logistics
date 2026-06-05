@@ -109,6 +109,12 @@ const driverAvailabilitySchema = new mongoose.Schema(
       // cleared back to null when trip completes in Bot 5
     },
 
+    pendingLoadId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Load',
+      default: null,
+    },
+
   },
   {
     timestamps: true,
