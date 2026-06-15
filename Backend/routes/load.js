@@ -1,46 +1,58 @@
 // routes/load.js
 
-const express = require('express')
+import express from 'express'
+import supabase from '../config/supabase.js'
+import { sendWhatsAppMessage } from '../services/whatsappService.js'
+
 const router = express.Router()
-const Load = require('../models/Load')
-const User = require('../models/User')
-const DriverAvailability = require('../models/DriverAvailability')
-const Bid = require('../models/Bid')
-const Match = require('../models/Match')
-const { sendWhatsAppMessage } = require('../services/whatsappService')
 
 // POST /load
 router.post('/', async (req, res) => {
   try {
     const { phone, source, destination, truckType, weight, cargoDescription, Smin, Smax, pickupBy, pickupAddress, deliveryAddress, receiverPhone } = req.body
 
-    const supplier = await User.findOne({ phone })
-    if (!supplier) return res.status(404).json({ success: false, error: 'Supplier not found' })
+    const { data: supplier, error: supplierError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('phone', phone)
+      .single()
 
-    const load = await Load.create({
-      supplierId: supplier._id,
-      supplierPhone: phone,
-      source,
-      destination,
-      truckType,
-      weight,
-      cargoDescription,
-      Smin,
-      Smax,
-      pickupBy,
-      pickupAddress,      // ← add
-      deliveryAddress,    // ← add
-      receiverPhone,      // ← add
-    })
+    if (supplierError || !supplier) return res.status(404).json({ success: false, error: 'Supplier not found' })
 
-    const matchingDrivers = await DriverAvailability.find({
-      source: load.source,
-      destination: load.destination,
-      truckType: load.truckType,
-      capacity: { $gte: load.weight },
-      status: 'ACTIVE',
-      Lmin: { $lte: load.Smin },
-    })
+    const { data: load, error: loadError } = await supabase
+      .from('loads')
+      .insert({
+        supplier_id: supplier.id,
+        supplier_phone: phone,
+        source: source.toUpperCase(),
+        destination: destination.toUpperCase(),
+        truck_type: truckType,
+        weight,
+        cargo_description: cargoDescription,
+        s_min: Smin,
+        s_max: Smax,
+        pickup_by: pickupBy,
+        pickup_address: pickupAddress,
+        delivery_address: deliveryAddress,
+        receiver_phone: receiverPhone,
+      })
+      .select()
+      .single()
+
+    if (loadError) return res.status(500).json({ success: false, error: loadError.message })
+
+
+    const { data: matchingDrivers, error: driversError } = await supabase
+      .from('driver_availability')
+      .select('*')
+      .eq('source', load.source)
+      .eq('destination', load.destination)
+      .eq('truck_type', load.truck_type)
+      .gte('capacity', load.weight)
+      .eq('status', 'ACTIVE')
+      .lte('l_min', load.s_min)
+
+    if (driversError) return res.status(500).json({ success: false, error: driversError.message })
 
     if (matchingDrivers.length === 0) {
       return res.status(201).json({
@@ -51,16 +63,23 @@ router.post('/', async (req, res) => {
     }
 
     for (const driver of matchingDrivers) {
-      // overwrite pendingLoadId with this load — latest notification wins
-      await DriverAvailability.findByIdAndUpdate(driver._id, { pendingLoadId: load._id })
+      await supabase
+        .from('driver_availability')
+        .update({ pending_load_id: load.id })
+        .eq('id', driver.id)
+
+      await supabase
+        .from('users')
+        .update({ conversation_state: 'AWAITING_BID_RESPONSE' })
+        .eq('phone', driver.phone)  
 
       await sendWhatsAppMessage(driver.phone,
         `New load on your route!\n` +
         `Route: ${load.source} → ${load.destination}\n` +
         `Weight: ${load.weight} tonnes\n` +
-        `Truck: ${load.truckType}\n` +
-        `Budget: ₹${load.Smin} - ₹${load.Smax}\n` +
-        `Pickup by: ${load.pickupBy}\n\n` +
+        `Truck: ${load.truck_type}\n` +
+        `Budget: ₹${load.s_min} - ₹${load.s_max}\n` +
+        `Pickup by: ${load.pickup_by}\n\n` +
         `Reply YES to accept or NO to pass.`
       )
     }
@@ -75,73 +94,139 @@ router.post('/', async (req, res) => {
   }
 })
 
+router.get('/my-loads/:phone', async (req, res) => {
+  try {
+    const { data: loads, error } = await supabase
+      .from('loads')
+      .select('*')
+      .eq('supplier_phone', req.params.phone)
+      .order('created_at', { ascending: false })
+
+    if (error) return res.status(500).json({ success: false, error: error.message })
+
+    if (!loads || loads.length === 0) {
+      return res.json({ success: true, loads: [], message: 'No loads found' })
+    }
+
+    res.json({ success: true, loads })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+
+router.get('/:id', async (req, res) => {
+  try {
+    const { data: load, error } = await supabase
+      .from('loads')
+      .select('*')
+      .eq('id', req.params.id)
+      .single()
+
+    if (error || !load) return res.status(404).json({ success: false, error: 'Load not found' })
+    res.json({ success: true, load })
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+
 async function settleAuction(loadId) {
   try {
-    const load = await Load.findById(loadId)
+    const { data: load, error: loadError } = await supabase
+      .from('loads')
+      .select('*')
+      .eq('id', loadId)
+      .single()
+
+    if (loadError || !load) return
     if (load.status !== 'BIDDING') return
 
-    const bids = await Bid.find({ loadId, status: 'PENDING' }).populate('driverAvailabilityId')
+    const { data: bids, error: bidsError } = await supabase
+      .from('bids')
+      .select('*, driver_availability_id(*)')
+      .eq('load_id', loadId)
+      .eq('status', 'PENDING')
+
+    if (bidsError || !bids.length) return
 
     const PRICING_MODE = 'HAPPY_SHIPPER'
 
     let winningBid = bids[0]
     for (const bid of bids) {
-      if (bid.driverAvailabilityId.Lmin < winningBid.driverAvailabilityId.Lmin) {
+      if (bid.driver_availability_id.l_min < winningBid.driver_availability_id.l_min) {
         winningBid = bid
       }
     }
 
     const priceMap = {
-      HAPPY_SHIPPER: load.Smin,
-      HAPPY_TRUCKER: (load.Smin + load.Smax) / 2,
-      HAPPY_BROKER: load.Smax,
+      HAPPY_SHIPPER: load.s_min,
+      HAPPY_TRUCKER: (load.s_min + load.s_max) / 2,
+      HAPPY_BROKER: load.s_max,
     }
     const finalPrice = priceMap[PRICING_MODE]
 
-    const match = await Match.create({
-      loadId: load._id,
-      driverAvailabilityId: winningBid.driverAvailabilityId._id,
-      driverId: winningBid.driverId,
-      supplierId: load.supplierId,
-      finalPrice,
-      pricingMode: PRICING_MODE,
-      orderId: load.source.substring(0, 3) + '-' + Math.floor(1000 + Math.random() * 9000),
-    })
+    const { data: match, error: matchError } = await supabase
+      .from('matches')
+      .insert({
+        load_id: load.id,
+        driver_availability_id: winningBid.driver_availability_id.id,
+        driver_id: winningBid.driver_id,
+        supplier_id: load.supplier_id,
+        final_price: finalPrice,
+        pricing_mode: PRICING_MODE,
+        order_id: load.source.substring(0, 3) + '-' + Math.floor(1000 + Math.random() * 9000),
+      })
+      .select()
+      .single()
 
-    load.status = 'MATCHED'
-    load.matchId = match._id
-    await load.save()
+    if (matchError) return console.error('match create error:', matchError.message)
 
-    await DriverAvailability.findByIdAndUpdate(winningBid.driverAvailabilityId._id, {
-      status: 'LOCKED',
-      currentMatchId: match._id,
-      pendingLoadId: null,
-    })
+    await supabase
+      .from('loads')
+      .update({ status: 'MATCHED', match_id: match.id })
+      .eq('id', load.id)
 
-    await Bid.findByIdAndUpdate(winningBid._id, { status: 'WON' })
-    await Bid.updateMany(
-      { loadId, status: 'PENDING', _id: { $ne: winningBid._id } },
-      { status: 'LOST' }
-    )
+    await supabase
+      .from('driver_availability')
+      .update({
+        status: 'LOCKED',
+        current_match_id: match.id,
+        pending_load_id: null,
+      })
+      .eq('id', winningBid.driver_availability_id.id)
 
-    await sendWhatsAppMessage(winningBid.driverAvailabilityId.phone,
+    await supabase
+      .from('bids')
+      .update({ status: 'WON' })
+      .eq('id', winningBid.id)
+
+    await supabase
+      .from('bids')
+      .update({ status: 'LOST' })
+      .eq('load_id', loadId)
+      .eq('status', 'PENDING')
+      .neq('id', winningBid.id)
+        
+
+    await sendWhatsAppMessage(winningBid.driver_availability_id.phone,
       `You got the load!\n` +
       `Route: ${load.source} → ${load.destination}\n` +
       `Final Price: ₹${finalPrice}\n` +
-      `Match ID: ${match._id}\n` +
+      `Match ID: ${match.id}\n` +
       `Please proceed to pickup.`
     )
 
-    await sendWhatsAppMessage(load.supplierPhone,
+    await sendWhatsAppMessage(load.supplier_phone,
       `Your load has been matched!\n` +
       `Route: ${load.source} → ${load.destination}\n` +
       `Final Price: ₹${finalPrice}\n` +
-      `Match ID: ${match._id}`
+      `Match ID: ${match.id}`
     )
 
-    const losingBids = bids.filter(b => b._id.toString() !== winningBid._id.toString())
+    const losingBids = bids.filter(b => b.id !== winningBid.id)
     for (const bid of losingBids) {
-      await sendWhatsAppMessage(bid.driverAvailabilityId.phone,
+      await sendWhatsAppMessage(bid.driver_availability_id.phone,
         `Sorry, another driver was selected for this load.\n` +
         `Route: ${load.source} → ${load.destination}`
       )
@@ -152,15 +237,5 @@ async function settleAuction(loadId) {
   }
 }
 
-router.get('/:id', async (req, res) => {
-  try {
-    const load = await Load.findById(req.params.id)
-    if (!load) return res.status(404).json({ success: false, error: 'Load not found' })
-    res.json({ success: true, load })
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message })
-  }
-})
-
-module.exports = router
-module.exports.settleAuction = settleAuction
+export default router
+export { settleAuction }
